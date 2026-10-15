@@ -29,6 +29,24 @@
 
 {% block content %}
 
+  <div class="text-center mb-3">
+    <img src="{% static 'logo-torneio.png' %}" alt="{{ tournament.name }}" class="tournament-logo">
+  </div>
+
+  <style>
+    .tournament-logo {
+      max-width: 280px;
+      width: 100%;
+      border-radius: 12px;
+      filter: drop-shadow(0 0 16px rgba(255, 102, 0, 0.6));
+      animation: logo-pulse 3s ease-in-out infinite;
+    }
+    @keyframes logo-pulse {
+      0%, 100% { filter: drop-shadow(0 0 16px rgba(255, 102, 0, 0.6)); }
+      50% { filter: drop-shadow(0 0 28px rgba(255, 102, 0, 1)); }
+    }
+  </style>
+
   {% if pref.welcome_message %}
     <div class="card">
       <div class="card-body pb-0">
