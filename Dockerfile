@@ -33,3 +33,8 @@ RUN npm ci
 # Compile all the static files
 RUN npm run build
 RUN python ./tabbycat/manage.py collectstatic --noinput -v 0
+
+# Run migrations and start the app
+CMD python ./tabbycat/manage.py migrate --noinput && \
+    sed -i "s/listen 8000/listen ${PORT:-8000}/" config/nginx.conf && \
+    honcho -f ProcfileMulti.docker start
