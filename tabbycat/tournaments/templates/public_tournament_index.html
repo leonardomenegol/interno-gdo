@@ -29,7 +29,7 @@
 
 {% block content %}
 
-  <div class="text-center mb-3">
+  <div class="text-center mb-3 d-md-none">
     <img src="{% static 'logo-torneio.png' %}" alt="{{ tournament.name }}" class="tournament-logo">
   </div>
 
@@ -55,17 +55,17 @@
     </div>
   {% endif %}
 
-  <div class="row">
+  <div class="row align-items-start">
 
-    <div class="col-md">
+    <div class="col-md-4 text-center d-none d-md-block pt-2">
+      <img src="{% static 'logo-torneio.png' %}" alt="{{ tournament.name }}" class="tournament-logo-side">
+    </div>
+
+    <div class="col-md-8 col-12">
 
       <div class="list-group mt-2">
 
         {% if pref.team_tab_released > 0 %}
-          {% trans "Team Tab" as text %}
-          {% tournamenturl 'standings-public-tab-team' as url %}
-          {% include "components/item-action.html" with icon="users" %}
-        {% endif %}
 
         {% if pref.break_category_tabs_released > 0 %}
           {% for category in tournament.break_categories_nongeneral %}
@@ -338,6 +338,15 @@
             border-radius: 8px;
             border: 1px solid #ff6600;
             opacity: 0.85;
+          }
+          .tournament-logo-side {
+            max-width: 220px;
+            width: 100%;
+            border-radius: 12px;
+            filter: drop-shadow(0 0 16px rgba(255, 102, 0, 0.6));
+            animation: logo-pulse 3s ease-in-out infinite;
+            position: sticky;
+            top: 20px;
           }
         </style>
       {% endif %}
