@@ -256,14 +256,75 @@
       </div>
 
       {% if pref.tournament_staff %}
-        <div class="card mt-3">
-          <div class="card-header h6">
+        <div class="card mt-3 halloween-staff-card">
+          <div class="card-header h6 halloween-staff-header">
+            <span class="halloween-icon">🎃</span>
             {% trans "Tournament Staff" %}
+            <span class="halloween-icon">🦇</span>
           </div>
-          <div class="card-body">
+          <div class="card-body halloween-staff-body">
+            <div class="halloween-gifs">
+              <img src="https://media.giphy.com/media/l0MYGb1LuZ3n7dRnO/giphy.gif" alt="halloween" class="halloween-gif">
+              <img src="https://media.giphy.com/media/1hWMC0dIKNyMz1qU9N/giphy.gif" alt="halloween" class="halloween-gif halloween-gif-right">
+            </div>
             {{ pref.tournament_staff|safe }}
           </div>
         </div>
+
+        <style>
+          .halloween-staff-card {
+            border: 2px solid #ff6600;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #1a0a2e 0%, #2d1b4e 50%, #1a0a2e 100%);
+            box-shadow: 0 0 20px rgba(255, 102, 0, 0.4), 0 0 40px rgba(255, 102, 0, 0.1);
+            overflow: hidden;
+          }
+          .halloween-staff-header {
+            background: linear-gradient(90deg, #2d1b00, #ff6600, #2d1b00);
+            color: #fff !important;
+            font-weight: bold;
+            letter-spacing: 1px;
+            border-bottom: 2px solid #ff6600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 16px;
+          }
+          .halloween-icon {
+            font-size: 1.2em;
+            animation: float 2s ease-in-out infinite;
+          }
+          .halloween-icon:last-child {
+            animation-delay: 0.5s;
+          }
+          @keyframes float {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-4px); }
+          }
+          .halloween-staff-body {
+            color: #e8c87d;
+            position: relative;
+            padding-top: 8px;
+          }
+          .halloween-staff-body strong, .halloween-staff-body b {
+            color: #ff9944;
+          }
+          .halloween-gifs {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            pointer-events: none;
+          }
+          .halloween-gif {
+            width: 80px;
+            height: 80px;
+            object-fit: cover;
+            border-radius: 8px;
+            border: 1px solid #ff6600;
+            opacity: 0.85;
+          }
+        </style>
       {% endif %}
 
     </div>
