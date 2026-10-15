@@ -1,0 +1,19 @@
+{% extends "wizard_registration_form.html" %}
+{% load i18n %}
+
+{% block page-alerts %}
+<div class="col-lg-8 ml-lg-auto mr-md-auto d-flex flex-column gap-3">
+  {% blocktrans trimmed asvar p1 %}
+    You may register speakers for the team, but if not all speakers are included, a link will be generated to let speakers register themselves to the team after submission which you can then distribute.
+  {% endblocktrans %}
+  {% include "components/explainer-card.html" with type="info" %}
+</div>
+{% endblock page-alerts %}
+
+{% block formset_form_header %}
+  <div class="card-header">
+    <h4 class="card-title mb-0">
+      {% blocktranslate trimmed with number=forloop.counter %}Speaker #{{ number }}{% endblocktranslate %}
+    </h4>
+  </div>
+{% endblock formset_form_header %}

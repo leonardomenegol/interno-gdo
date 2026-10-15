@@ -1,0 +1,1047 @@
+import logging
+from statistics import mean
+
+from django.test import TestCase
+
+from adjallocation.models import DebateAdjudicator
+from draw.models import Debate, DebateTeam
+from draw.types import DebateSide
+from participants.models import Adjudicator, Institution, Speaker, Team
+from results.models import BallotSubmission, ScoreCriterion, SpeakerScore, SpeakerScoreByAdj, TeamScore
+from results.result import ConsensusDebateResultWithScores, DebateResultByAdjudicatorWithScores, ResultError    # absolute import to keep logger's name consistent
+from tournaments.models import Round, Tournament
+from utils.tests import suppress_logs
+from venues.models import Venue
+
+
+# ==============================================================================
+# Test decorators
+# ==============================================================================
+
+def standard_test(test_fn):
+    """Decorator. Tests on all dataset in self.testdata, and all scoresheet
+    types listed in the arguments. Tests should take four arguments: self,
+    result, testdata and scoresheet_type, where
+    `result` is a DebateResult object,
+    `testdata` is a value in `BaseTestDebateResult.testdata`, and
+    `scoresheet_type` is one of the scoresheet_types.
+    """
+    def wrapped(self):
+      for scoresheet_type in ['high-required']:  # noqa: E111
+        # with self.subTest(scoresheet_type=scoresheet_type):
+          # noqa: E114 self.set_tournament_preference('scoring', 'scoresheet_type', scoresheet_type)  # noqa: E111
+          for key, testdata in self.testdata.items():  # noqa: E111
+            with self.subTest(testdata=key):
+              if not testdata[scoresheet_type]['valid']:  # noqa: E111
+                self.assertRaises(ResultError, self.save_complete_result, testdata)
+              else:  # noqa: E111
+                self.save_complete_result(testdata)
+                result = self.get_result()
+                test_fn(self, result, testdata, scoresheet_type)
+    return wrapped
+
+
+def with_preference(section, name, value):
+    """Decorator. Sets a tournament preference before it begins the wrapped
+    function. The main purpose of this decorator is to be used with other
+    decorators, otherwise it could obviously just be achieved with a single
+    line at the beginning of the function. This decorator should normally be
+    placed first in the decorator chain, so that it is the outermost
+    wrapper."""
+    def wrap(test_fn):
+        def wrapped(self):
+            self.set_tournament_preference(section, name, value)
+            test_fn(self)
+        return wrapped
+    return wrap
+
+
+def incomplete_test(test_fn):
+    """Decorator. The test function should somehow make `result` incomplete.
+    This then wraps the function to assert that the result does indeed think
+    itself to be incomplete."""
+    def wrap(self):
+        testdata = self.testdata['high']
+        if not BallotSubmission.objects.filter(debate=self.debate, confirmed=True).exists():
+            self.save_complete_result(testdata)
+        result = self.get_result()
+        test_fn(self, result)
+        self.assertFalse(result.is_complete())
+        self.assertFalse(result.is_valid())
+    return wrap
+
+
+def bad_load_assertion_test(test_fn):
+    """Decorator. The test function should somehow make `result` incorrectly
+    loaded. This then wraps the function to assert that the result does indeed
+    think itself to be incorrectly loaded."""
+    def wrap(self):
+        testdata = self.testdata['high']
+        if not BallotSubmission.objects.filter(debate=self.debate, confirmed=True).exists():
+            self.save_complete_result(testdata)
+        result = self.get_result()
+        test_fn(self, result)
+        self.assertRaises(AssertionError, result.assert_loaded)
+    return wrap
+
+
+# ==============================================================================
+# Base class and mixins
+# ==============================================================================
+
+class BaseTestDebateResult(TestCase):
+
+    SIDES = [DebateSide.AFF, DebateSide.NEG]
+
+    def setUp(self):
+        self.tournament = Tournament.objects.create(slug="resulttest", name="ResultTest")
+        self.teams = []
+        for i in range(2):
+            inst = Institution.objects.create(code="Inst{:d}".format(i), name="Institution {:d}".format(i))
+            team = Team.objects.create(tournament=self.tournament, institution=inst, reference="Team {:d}".format(i), use_institution_prefix=False)
+            self.teams.append(team)
+            for j in range(3):
+                Speaker.objects.create(team=team, name="Speaker {:d}-{:d}".format(i, j))
+
+        venue = Venue.objects.create(name="Venue", priority=10)
+
+        rd = Round.objects.create(tournament=self.tournament, seq=1, schedule_group=1, abbreviation="R1")
+        self.debate = Debate.objects.create(round=rd, venue=venue)
+
+        sides = [0, 1]
+        for team, side in zip(Team.objects.all(), sides):
+            DebateTeam.objects.create(debate=self.debate, team=team, side=side)
+
+        inst = Institution.objects.create(code="Adjs", name="Adjudicators")
+        self.adjs = [Adjudicator.objects.create(tournament=self.tournament, institution=inst,
+                name="Adjudicator {:d}".format(i), base_score=5) for i in range(3)]
+
+    def tearDown(self):
+        DebateTeam.objects.all().delete()
+        Institution.objects.all().delete()
+        self.tournament.delete()
+
+    def set_tournament_preference(self, section, name, value):
+        self.tournament.preferences[section + '__' + name] = value
+        if name in self.tournament._prefs:    # clear model-level cache
+            del self.tournament._prefs[name]
+
+    def get_result(self):
+        ballotsub = BallotSubmission.objects.get(debate=self.debate, confirmed=True)
+        return self.debate_result_class(ballotsub)
+
+    def save_blank_result(self, nadjs=3, nspeakers=3):
+
+        self.set_tournament_preference('debate_rules', 'substantive_speakers', nspeakers)
+
+        # set debate adjudicators (depends on how many adjs there are, so can't do in setUp())
+        self.debate.adjudicators.chair = self.adjs[0]
+        self.debate.adjudicators.panellists = self.adjs[1:nadjs]
+        with suppress_logs('adjallocation.allocation', logging.INFO):
+            self.debate.adjudicators.save()
+
+        # unconfirm existing ballots
+        self.debate.ballotsubmission_set.update(confirmed=False)
+
+        ballotsub = BallotSubmission.objects.create(debate=self.debate, confirmed=True,
+                submitter_type=BallotSubmission.Submitter.TABROOM)
+
+        return self.debate_result_class(ballotsub)
+
+    def save_complete_result(self, testdata, post_create=None):
+
+        nspeakers = testdata['num_speakers_per_team']
+
+        result = self.save_blank_result(nadjs=testdata['num_adjs'], nspeakers=nspeakers)
+        if post_create:
+            post_create(result)
+
+        for side, team in zip(self.SIDES, self.teams):
+            speakers = team.speaker_set.all()[0:nspeakers]
+            for pos, speaker in enumerate(speakers, start=1):
+                result.set_speaker(side, pos, speaker)
+            result.set_speaker(side, nspeakers+1, speakers[0])
+            # ghost fields should be False by default
+
+        self.save_scores_to_result(testdata, result)
+
+        with suppress_logs('results.result', logging.WARNING):
+            result.save()
+
+    def _get_speakerscore_in_db(self, side, pos):
+        return SpeakerScore.objects.get(
+            ballot_submission__debate=self.debate,
+            ballot_submission__confirmed=True,
+            debate_team__side=side,
+            position=pos,
+        )
+
+    def _get_teamscore_in_db(self, side):
+        return TeamScore.objects.get(
+            ballot_submission__debate=self.debate,
+            ballot_submission__confirmed=True,
+            debate_team__side=side,
+        )
+
+    def _unset_sides(self):
+        self.debate.sides_confirmed = False
+        self.debate.save()
+
+
+class GeneralSpeakerTestsMixin:
+
+    @standard_test
+    def test_save(self, result, testdata, scoresheet_type):
+        # Run self.save_complete_result and check completeness
+        self.assertTrue(result.is_complete())
+
+    def test_unknown_speaker(self):
+        self.save_complete_result(self.testdata['high'])
+        result = self.get_result()
+        neg_speaker = self.teams[1].speaker_set.first()
+        with self.assertLogs('results.result', level=logging.ERROR):
+            result.set_speaker(DebateSide.AFF, 1, neg_speaker)
+
+    def test_save_speaker_with_unknown_sides(self):
+        self._unset_sides()
+        result = self.save_blank_result()
+        speaker = self.teams[0].speaker_set.first()
+        self.assertRaises(TypeError, result.set_speaker, DebateSide.AFF, 1, speaker)
+
+    @incomplete_test
+    def test_unfilled_debateteam(self, result):
+        result.debateteams[DebateSide.AFF] = None
+
+    @incomplete_test
+    def test_unfilled_speaker(self, result):
+        result.speakers[DebateSide.NEG][1] = None
+
+    @bad_load_assertion_test
+    def test_extraneous_debateteam(self, result):
+        result.debateteams["test"] = None
+
+    @bad_load_assertion_test
+    def test_extraneous_team_in_speakers(self, result):
+        result.speakers["test"] = None
+
+    @bad_load_assertion_test
+    def test_extraneous_team_in_ghosts(self, result):
+        result.ghosts["test"] = True
+
+    @bad_load_assertion_test
+    def test_extraneous_speaker(self, result):
+        result.speakers[DebateSide.AFF][5] = None
+
+    @bad_load_assertion_test
+    def test_extraneous_ghost(self, result):
+        result.ghosts[DebateSide.AFF][5] = None
+
+
+# ==============================================================================
+# Actual test case classes
+# ==============================================================================
+
+class TestVotingDebateResultWithScores(GeneralSpeakerTestsMixin, BaseTestDebateResult):
+
+    # Currently, the low-allowed and tie-allowed data aren't actually used, but
+    # they are in place for future use, for when declared winners get fully
+    # implemented.
+
+    debate_result_class = DebateResultByAdjudicatorWithScores
+    testdata = dict()
+
+    testdata['high'] = { # standard high-point win
+        'input': {
+            'declared_winners': [DebateSide.AFF, DebateSide.NEG, DebateSide.NEG],
+            'scores': [[[75.0, 76.0, 74.0, 38.0], [76.0, 73.0, 75.0, 37.5]],
+                       [[74.0, 75.0, 76.0, 37.0], [77.0, 74.0, 74.0, 38.0]],
+                       [[75.0, 75.0, 75.0, 37.5], [76.0, 78.0, 77.0, 37.0]]]},
+        'num_adjs': 3,
+        'num_speakers_per_team': 3,
+        'common': {
+            'everyone_margins': [-1.66666666666667, 1.66666666666667],
+            'everyone_scores': [[74.66666666666667, 75.33333333333333, 75.0, 37.5],
+                                [76.33333333333333, 75.0, 75.33333333333333, 37.5]],
+            'everyone_totals': [262.5, 264.16666666666663],
+            'totals_by_adj': [[263.0, 261.5], [262.0, 263.0], [262.5, 268.0]]},
+        'high-required': {
+            'majority_adjs': [1, 2],
+            'majority_margins': [-3.25, 3.25],
+            'majority_scores': [[74.5, 75.0, 75.5, 37.25], [76.5, 76.0, 75.5, 37.5]],
+            'majority_totals': [262.25, 265.5],
+            'num_adjs_for_team': [1, 2],
+            'sheets_valid': [True, True, True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.AFF, DebateSide.NEG, DebateSide.NEG]},
+        'low-allowed': {
+            'majority_adjs': [1, 2],
+            'majority_margins': [-3.25, 3.25],
+            'majority_scores': [[74.5, 75.0, 75.5, 37.25], [76.5, 76.0, 75.5, 37.5]],
+            'majority_totals': [262.25, 265.5],
+            'num_adjs_for_team': [1, 2],
+            'sheets_valid': [True, True, True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.AFF, DebateSide.NEG, DebateSide.NEG]},
+        'tied-allowed': {
+            'majority_adjs': [1, 2],
+            'majority_margins': [-3.25, 3.25],
+            'majority_scores': [[74.5, 75.0, 75.5, 37.25], [76.5, 76.0, 75.5, 37.5]],
+            'majority_totals': [262.25, 265.5],
+            'num_adjs_for_team': [1, 2],
+            'sheets_valid': [True, True, True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.AFF, DebateSide.NEG, DebateSide.NEG]},
+    }
+
+    testdata['low'] = { # contains low-point wins that reverse the result
+        'input': {
+            'declared_winners': [DebateSide.AFF, DebateSide.AFF, DebateSide.NEG],
+            'scores': [[[73.0, 76.0, 79.0, 37.5], [77.0, 77.0, 78.0, 39.0]],
+                       [[79.0, 80.0, 70.0, 36.0], [78.0, 79.0, 73.0, 37.0]],
+                       [[73.0, 70.0, 77.0, 35.0], [76.0, 76.0, 77.0, 37.0]]]},
+        'num_adjs': 3,
+        'num_speakers_per_team': 3,
+        'common': {
+            'everyone_margins': [-6.166666666666686, 6.166666666666686],
+            'everyone_scores': [[75.0, 75.33333333333333, 75.33333333333333, 36.166666666666664],
+                                [77.0, 77.33333333333333, 76.0, 37.666666666666664]],
+            'everyone_totals': [261.8333333333333, 268.0],
+            'totals_by_adj': [[265.5, 271.0], [265.0, 267.0], [255.0, 266.0]]},
+        'high-required': {
+            'majority_adjs': [0, 1, 2],
+            'majority_margins': [-6.166666666666686, 6.166666666666686],
+            'majority_scores': [[75.0, 75.33333333333333, 75.33333333333333, 36.166666666666664],
+                                [77.0, 77.33333333333333, 76.0, 37.666666666666664]],
+            'majority_totals': [261.8333333333333, 268.0],
+            'num_adjs_for_team': [0, 3],
+            'sheets_valid': [True, True, True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.NEG, DebateSide.NEG, DebateSide.NEG]},
+        'low-allowed': {
+            'majority_adjs': [0, 1],
+            'majority_margins': [-3.75, 3.75],
+            'majority_scores': [[76.0, 78.0, 74.5, 36.75], [77.5, 78.0, 75.5, 38.0]],
+            'majority_totals': [265.25, 269.0],
+            'num_adjs_for_team': [2, 1],
+            'sheets_valid': [True, True, True],
+            'valid': True,
+            'winner': DebateSide.AFF,
+            'winner_by_adj': [DebateSide.AFF, DebateSide.AFF, DebateSide.NEG]},
+        'tied-allowed': {
+            'sheets_valid': [False, False, True],
+            'valid': False,
+            'winner_by_adj': [None, None, DebateSide.NEG]},
+    }
+
+    testdata['tie'] = { # contains three tied-point wins
+        'input': {
+            'declared_winners': [DebateSide.NEG, DebateSide.AFF, DebateSide.NEG],
+            'scores': [[[73.0, 72.0, 78.0, 40.0], [73.0, 75.0, 75.0, 40.0]],
+                      [[79.0, 73.0, 77.0, 39.5], [79.0, 75.0, 75.0, 39.5]],
+                      [[75.0, 78.0, 77.0, 38.0], [72.0, 78.0, 80.0, 38.0]]]},
+        'num_adjs': 3,
+        'num_speakers_per_team': 3,
+        'common': {
+            'everyone_margins': [0.0, 0.0],
+            'everyone_scores': [[75.66666666666667, 74.33333333333333, 77.33333333333333, 39.166666666666664],
+                                [74.66666666666667, 76.0, 76.66666666666667, 39.166666666666664]],
+            'everyone_totals': [266.5, 266.50000000000006],
+            'totals_by_adj': [[263.0, 263.0], [268.5, 268.5], [268.0, 268.0]]},
+        'high-required': {
+            'sheets_valid': [False, False, False],
+            'valid': False,
+            'winner_by_adj': [None, None, None]},
+        'low-allowed': {
+            'majority_adjs': [0, 2],
+            'majority_margins': [0.0, 0.0],
+            'majority_scores': [[74.0, 75.0, 77.5, 39.0], [72.5, 76.5, 77.5, 39.0]],
+            'majority_totals': [265.5, 265.5],
+            'num_adjs_for_team': [1, 2],
+            'sheets_valid': [True, True, True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.NEG, DebateSide.AFF, DebateSide.NEG]},
+        'tied-allowed': {
+            'majority_adjs': [0, 2],
+            'majority_margins': [0.0, 0.0],
+            'majority_scores': [[74.0, 75.0, 77.5, 39.0], [72.5, 76.5, 77.5, 39.0]],
+            'majority_totals': [265.5, 265.5],
+            'num_adjs_for_team': [1, 2],
+            'sheets_valid': [True, True, True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.NEG, DebateSide.AFF, DebateSide.NEG]},
+    }
+
+    testdata['solo'] = {  # just one adjudicator
+        'input': {
+            'declared_winners': [DebateSide.NEG],
+            'scores': [[[74.0, 76.0, 37.5], [74.0, 77.0, 37.0]]]},
+        'num_adjs': 1,
+        'num_speakers_per_team': 2,
+        'common': {
+            'everyone_margins': [-0.5, 0.5],
+            'everyone_scores': [[74.0, 76.0, 37.5], [74.0, 77.0, 37.0]],
+            'everyone_totals': [187.5, 188.0],
+            'totals_by_adj': [[187.5, 188.0]]},
+        'high-required': {
+            'majority_adjs': [0],
+            'majority_margins': [-0.5, 0.5],
+            'majority_scores': [[74.0, 76.0, 37.5], [74.0, 77.0, 37.0]],
+            'majority_totals': [187.5, 188.0],
+            'num_adjs_for_team': [0, 1],
+            'sheets_valid': [True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.NEG]},
+        'low-allowed': {
+            'majority_adjs': [0],
+            'majority_margins': [-0.5, 0.5],
+            'majority_scores': [[74.0, 76.0, 37.5], [74.0, 77.0, 37.0]],
+            'majority_totals': [187.5, 188.0],
+            'num_adjs_for_team': [0, 1],
+            'sheets_valid': [True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.NEG]},
+        'tied-allowed': {
+            'majority_adjs': [0],
+            'majority_margins': [-0.5, 0.5],
+            'majority_scores': [[74.0, 76.0, 37.5], [74.0, 77.0, 37.0]],
+            'majority_totals': [187.5, 188.0],
+            'num_adjs_for_team': [0, 1],
+            'sheets_valid': [True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.NEG]},
+    }
+
+    testdata['even'] = { # even panel, chair gets casting vote, note this is a low-point win
+        'common': {
+            'everyone_margins': [4.25, -4.25],
+            'everyone_scores': [[80.0, 76.5, 36.5], [76.0, 73.5, 39.25]],
+            'everyone_totals': [193.0, 188.75],
+            'totals_by_adj': [[189.5, 194.0], [196.5, 183.5]]},
+        'high-required': {
+            'majority_adjs': [0],
+            'majority_margins': [-4.5, 4.5],
+            'majority_scores': [[80.0, 74.0, 35.5], [79.0, 76.0, 39.0]],
+            'majority_totals': [189.5, 194.0],
+            'num_adjs_for_team': [1, 1],
+            'sheets_valid': [True, True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.NEG, DebateSide.AFF]},
+        'input': {
+            'declared_winners': [DebateSide.NEG, DebateSide.AFF],
+            'scores': [[[80.0, 74.0, 35.5], [79.0, 76.0, 39.0]], [[80.0, 79.0, 37.5], [73.0, 71.0, 39.5]]]},
+        'low-allowed': {
+            'majority_adjs': [0],
+            'majority_margins': [-4.5, 4.5],
+            'majority_scores': [[80.0, 74.0, 35.5], [79.0, 76.0, 39.0]],
+            'majority_totals': [189.5, 194.0],
+            'num_adjs_for_team': [1, 1],
+            'sheets_valid': [True, True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.NEG, DebateSide.AFF]},
+        'num_adjs': 2,
+        'num_speakers_per_team': 2,
+        'tied-allowed': {
+            'majority_adjs': [0],
+            'majority_margins': [-4.5, 4.5],
+            'majority_scores': [[80.0, 74.0, 35.5], [79.0, 76.0, 39.0]],
+            'majority_totals': [189.5, 194.0],
+            'num_adjs_for_team': [1, 1],
+            'sheets_valid': [True, True],
+            'valid': True,
+            'winner': DebateSide.NEG,
+            'winner_by_adj': [DebateSide.NEG, DebateSide.AFF]},
+    }
+
+    def save_scores_to_result(self, testdata, result):
+        if result.uses_speakers:
+            for adj, sheet in zip(self.adjs, testdata['input']['scores']):
+                for side, teamscores in zip(self.SIDES, sheet):
+                    for pos, score in enumerate(teamscores, start=1):
+                        result.set_score(adj, side, pos, score)
+
+        if result.uses_declared_winners:
+            for adj, declared_winner in zip(self.adjs, testdata['input']['declared_winners']):
+                result.add_winner(adj, declared_winner)
+
+    # ==========================================================================
+    # Normal operation
+    # ==========================================================================
+
+    @standard_test
+    def test_totals_by_adj(self, result, testdata, scoresheet_type):
+        for adj, totals in zip(self.adjs, testdata['common']['totals_by_adj']):
+            for side, total in zip(self.SIDES, totals):
+                self.assertEqual(total, result.scoresheets[adj].get_total(side))
+
+    @standard_test
+    def test_majority_adjudicators(self, result, testdata, scoresheet_type):
+        majority = [self.adjs[i] for i in testdata[scoresheet_type]['majority_adjs']]
+        with suppress_logs('results.result', logging.WARNING):
+            self.assertCountEqual(majority, result.majority_adjudicators())
+
+    @standard_test
+    def test_individual_scores(self, result, testdata, scoresheet_type):
+        for adj, sheet in zip(self.adjs, testdata['input']['scores']):
+            for side, scores in zip(self.SIDES, sheet):
+                for pos, score in enumerate(scores, start=1):
+                    score_in_db = SpeakerScoreByAdj.objects.get(
+                        ballot_submission__debate=self.debate,
+                        ballot_submission__confirmed=True,
+                        debate_team__side=side,
+                        debate_adjudicator__adjudicator=adj,
+                        position=pos).score
+                    self.assertEqual(score, score_in_db)
+                    self.assertEqual(score, result.get_score(adj, side, pos))
+
+    def test_speaker_score_by_adj_speaker_score_relation(self):
+        self.save_complete_result(self.testdata['high'])
+        speaker = self.teams[0].speaker_set.first()
+
+        score = SpeakerScoreByAdj.objects.select_related('speaker_score__speaker').get(
+            ballot_submission__debate=self.debate,
+            ballot_submission__confirmed=True,
+            debate_team__team=self.teams[0],
+            debate_adjudicator__adjudicator=self.adjs[0],
+            position=1,
+        )
+
+        with self.assertNumQueries(0):
+            self.assertEqual(score.speaker_score.speaker, speaker)
+
+        self.assertEqual(
+            SpeakerScoreByAdj.objects.filter(
+                speaker_score__speaker=speaker,
+                position=1,
+            ).count(),
+            len(self.adjs),
+        )
+
+    @standard_test
+    def test_winner_by_adj(self, result, testdata, scoresheet_type):
+        for adj, winner in zip(self.adjs, testdata[scoresheet_type]['winner_by_adj']):
+            if winner is None:
+                self.assertEqual(len(result.scoresheets[adj].winners()), 0)
+            else:
+                self.assertEqual(result.get_winner(adj), winner)
+
+    # --------------------------------------------------------------------------
+    # Speaker scores
+    # --------------------------------------------------------------------------
+
+    @with_preference('scoring', 'margin_includes_dissenters', False)
+    @standard_test
+    def test_speaker_scores_majority(self, result, testdata, scoresheet_type):
+        for side, totals in zip(self.SIDES, testdata[scoresheet_type]['majority_scores']):
+            for pos, score in enumerate(totals, start=1):
+                with suppress_logs('results.result', logging.WARNING):
+                    self.assertAlmostEqual(score, self._get_speakerscore_in_db(side, pos).score)
+                    self.assertAlmostEqual(score, result.speakerscore_field_score(side, pos))
+
+    @with_preference('scoring', 'margin_includes_dissenters', True)
+    @standard_test
+    def test_speaker_scores_everyone(self, result, testdata, scoresheet_type):
+        for side, totals in zip(self.SIDES, testdata['common']['everyone_scores']):
+            for pos, score in enumerate(totals, start=1):
+                with suppress_logs('results.result', logging.WARNING):
+                    self.assertAlmostEqual(score, self._get_speakerscore_in_db(side, pos).score)
+                    self.assertAlmostEqual(score, result.speakerscore_field_score(side, pos))
+
+    # --------------------------------------------------------------------------
+    # Team scores
+    # --------------------------------------------------------------------------
+
+    @standard_test
+    def test_teamscore_field_points(self, result, testdata, scoresheet_type):
+        for side in self.SIDES:
+            points = 1 if side == testdata[scoresheet_type]['winner'] else 0
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertEqual(points, self._get_teamscore_in_db(side).points)
+                self.assertEqual(points, result.teamscore_field_points(side))
+
+    @standard_test
+    def test_teamscore_field_win(self, result, testdata, scoresheet_type):
+        for side in self.SIDES:
+            win = side == testdata[scoresheet_type]['winner']
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertEqual(win, self._get_teamscore_in_db(side).win)
+                self.assertEqual(win, result.teamscore_field_win(side))
+
+    @with_preference('scoring', 'margin_includes_dissenters', False)
+    @standard_test
+    def test_teamscore_field_score_majority(self, result, testdata, scoresheet_type):
+        for side, total in zip(self.SIDES, testdata[scoresheet_type]['majority_totals']):
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertAlmostEqual(total, self._get_teamscore_in_db(side).score)
+                self.assertAlmostEqual(total, result.teamscore_field_score(side))
+
+    @with_preference('scoring', 'margin_includes_dissenters', False)
+    @standard_test
+    def test_teamscore_field_margin_majority(self, result, testdata, scoresheet_type):
+        for side, margin in zip(self.SIDES, testdata[scoresheet_type]['majority_margins']):
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertAlmostEqual(margin, self._get_teamscore_in_db(side).margin)
+                self.assertAlmostEqual(margin, result.teamscore_field_margin(side))
+
+    @with_preference('scoring', 'margin_includes_dissenters', True)
+    @standard_test
+    def test_teamscore_field_score_everyone(self, result, testdata, scoresheet_type):
+        for side, total in zip(self.SIDES, testdata['common']['everyone_totals']):
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertAlmostEqual(total, self._get_teamscore_in_db(side).score)
+                self.assertAlmostEqual(total, result.teamscore_field_score(side))
+
+    @with_preference('scoring', 'margin_includes_dissenters', True)
+    @standard_test
+    def test_teamscore_field_margin_everyone(self, result, testdata, scoresheet_type):
+        for side, margin in zip(self.SIDES, testdata['common']['everyone_margins']):
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertAlmostEqual(margin, self._get_teamscore_in_db(side).margin)
+                self.assertAlmostEqual(margin, result.teamscore_field_margin(side))
+
+    @standard_test
+    def test_teamscore_field_votes_given(self, result, testdata, scoresheet_type):
+        for side, votes in zip(self.SIDES, testdata[scoresheet_type]['num_adjs_for_team']):
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertEqual(votes, self._get_teamscore_in_db(side).votes_given)
+                self.assertEqual(votes, result.teamscore_field_votes_given(side))
+
+    @standard_test
+    def test_teamscore_field_votes_possible(self, result, testdata, scoresheet_type):
+        nadjs = testdata['num_adjs']
+        for side in self.SIDES:
+            self.assertEqual(nadjs, self._get_teamscore_in_db(side).votes_possible)
+            self.assertEqual(nadjs, result.teamscore_field_votes_possible(side))
+
+    def test_self_split_votes_given_and_possible(self):
+        """Test that solo adjudicator with self_split=True gives 2 votes for winner, 1 for loser.
+
+        Without self_split: winner gets 1/1 vote, loser gets 0/1.
+        With self_split: winner gets 2/3 votes, loser gets 1/3.
+        This confirms the feature modifies voting totals as expected.
+        """
+        testdata = self.testdata['solo']
+
+        def set_self_split(result):
+            result.ballotsub.self_split = True
+            result.ballotsub.save()
+
+        self.save_complete_result(testdata, post_create=set_self_split)
+
+        result = self.get_result()
+        scoresheet_type = 'high-required'
+        winner = testdata[scoresheet_type]['winner']
+
+        # Winner should have votes_given=2, votes_possible=3
+        with suppress_logs('results.result', logging.WARNING):
+            self.assertEqual(2, self._get_teamscore_in_db(winner).votes_given)
+            self.assertEqual(3, self._get_teamscore_in_db(winner).votes_possible)
+            self.assertEqual(2, result.teamscore_field_votes_given(winner))
+            self.assertEqual(3, result.teamscore_field_votes_possible(winner))
+
+        # Loser should have votes_given=1, votes_possible=3
+        loser = DebateSide.AFF if winner == DebateSide.NEG else DebateSide.NEG
+        with suppress_logs('results.result', logging.WARNING):
+            self.assertEqual(1, self._get_teamscore_in_db(loser).votes_given)
+            self.assertEqual(3, self._get_teamscore_in_db(loser).votes_possible)
+            self.assertEqual(1, result.teamscore_field_votes_given(loser))
+            self.assertEqual(3, result.teamscore_field_votes_possible(loser))
+
+    def test_self_split_adjudicators_with_splits(self):
+        """Test that solo adjudicator with self_split=True is marked as split=True.
+
+        Without self_split: solo adjudicator has split=False (trivially unanimous).
+        With self_split: solo adjudicator has split=True (self-declared split).
+        """
+        testdata = self.testdata['solo']
+
+        def set_self_split(result):
+            result.ballotsub.self_split = True
+            result.ballotsub.save()
+
+        self.save_complete_result(testdata, post_create=set_self_split)
+
+        result = self.get_result()
+
+        # Get the adjudicators with splits generator
+        adjs_with_splits = list(result.adjudicators_with_splits())
+
+        # Should have exactly one adjudicator marked as split=True
+        self.assertEqual(len(adjs_with_splits), 1)
+        adj, adjtype, split = adjs_with_splits[0]
+        self.assertEqual(adj, self.adjs[0])  # The solo chair adjudicator
+        self.assertTrue(split)
+
+    def test_self_split_does_not_mark_trainees_as_split(self):
+        testdata = self.testdata['solo']
+
+        def set_self_split_and_add_trainee(result):
+            result.ballotsub.self_split = True
+            result.ballotsub.save()
+            DebateAdjudicator.objects.create(
+                debate=self.debate,
+                adjudicator=self.adjs[1],
+                type=DebateAdjudicator.TYPE_TRAINEE,
+            )
+
+        self.save_complete_result(testdata, post_create=set_self_split_and_add_trainee)
+
+        splits_by_adj = {
+            adj: split for adj, adjtype, split in self.get_result().adjudicators_with_splits()
+        }
+        self.assertTrue(splits_by_adj[self.adjs[0]])
+        self.assertFalse(splits_by_adj[self.adjs[1]])
+
+    def test_solo_default_behavior_unchanged(self):
+        """Regression test: solo adjudicator without self_split unchanged.
+
+        Confirms the feature is opt-in and doesn't change default behavior.
+        Without self_split (the default), should be 1/1 vote for winner, 0/1 for loser.
+        With self_split=False: split=False for the adjudicator.
+        """
+        testdata = self.testdata['solo']
+        self.save_complete_result(testdata)  # No post_create callback, self_split stays False
+
+        result = self.get_result()
+        scoresheet_type = 'high-required'
+        winner = testdata[scoresheet_type]['winner']
+
+        # Without self_split, winner should have votes_given=1, votes_possible=1
+        with suppress_logs('results.result', logging.WARNING):
+            self.assertEqual(1, self._get_teamscore_in_db(winner).votes_given)
+            self.assertEqual(1, self._get_teamscore_in_db(winner).votes_possible)
+            self.assertEqual(1, result.teamscore_field_votes_given(winner))
+            self.assertEqual(1, result.teamscore_field_votes_possible(winner))
+
+        # Loser should have votes_given=0, votes_possible=1
+        loser = DebateSide.AFF if winner == DebateSide.NEG else DebateSide.NEG
+        with suppress_logs('results.result', logging.WARNING):
+            self.assertEqual(0, self._get_teamscore_in_db(loser).votes_given)
+            self.assertEqual(1, self._get_teamscore_in_db(loser).votes_possible)
+            self.assertEqual(0, result.teamscore_field_votes_given(loser))
+            self.assertEqual(1, result.teamscore_field_votes_possible(loser))
+
+        # Adjudicators with splits should yield split=False
+        adjs_with_splits = list(result.adjudicators_with_splits())
+        self.assertEqual(len(adjs_with_splits), 1)
+        adj, adjtype, split = adjs_with_splits[0]
+        self.assertFalse(split)
+
+    # ==========================================================================
+    # Median aggregation tests
+    # ==========================================================================
+
+    @with_preference('scoring', 'score_aggregation_function', 'median')
+    @with_preference('scoring', 'margin_includes_dissenters', True)
+    @standard_test
+    def test_median_aggregation_odd_panel(self, result, testdata, scoresheet_type):
+        """Test median aggregation with odd-sized panels (uses true median)."""
+        # With 3 adjudicators and margin_includes_dissenters=True, all are included (odd),
+        # so the aggregator should use the true median
+        if testdata['num_adjs'] != 3:
+            self.skipTest("This test is for 3-adjudicator panels")
+
+        # Only test 'high' testdata for now (has well-known expected values)
+        if testdata != self.testdata.get('high'):
+            self.skipTest("This test is only defined for 'high' testdata")
+
+        # For 'high' testdata with 3 adjs:
+        # AFF pos 1: [75.0, 74.0, 75.0] -> sorted [74, 75, 75] -> median = 75.0
+        # AFF pos 2: [76.0, 75.0, 75.0] -> sorted [75, 75, 76] -> median = 75.0
+        # AFF pos 3: [74.0, 76.0, 75.0] -> sorted [74, 75, 76] -> median = 75.0
+        # AFF pos 4 (reply): [38.0, 37.0, 37.5] -> sorted [37, 37.5, 38] -> median = 37.5
+        expected_aff_scores = [75.0, 75.0, 75.0, 37.5]
+
+        # NEG pos 1: [76.0, 77.0, 76.0] -> sorted [76, 76, 77] -> median = 76.0
+        # NEG pos 2: [73.0, 74.0, 78.0] -> sorted [73, 74, 78] -> median = 74.0
+        # NEG pos 3: [75.0, 74.0, 77.0] -> sorted [74, 75, 77] -> median = 75.0
+        # NEG pos 4 (reply): [37.5, 38.0, 37.0] -> sorted [37, 37.5, 38] -> median = 37.5
+        expected_neg_scores = [76.0, 74.0, 75.0, 37.5]
+
+        for pos, (aff_expected, neg_expected) in enumerate(zip(expected_aff_scores, expected_neg_scores), start=1):
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertAlmostEqual(aff_expected, self._get_speakerscore_in_db(DebateSide.AFF, pos).score,
+                                       msg=f"AFF position {pos} score mismatch")
+                self.assertAlmostEqual(neg_expected, self._get_speakerscore_in_db(DebateSide.NEG, pos).score,
+                                       msg=f"NEG position {pos} score mismatch")
+
+        self.assertAlmostEqual(testdata['common']['everyone_totals'][0],
+                               self._get_teamscore_in_db(DebateSide.AFF).score)
+        self.assertAlmostEqual(testdata['common']['everyone_totals'][1],
+                               self._get_teamscore_in_db(DebateSide.NEG).score)
+
+    @with_preference('scoring', 'score_aggregation_function', 'median')
+    @with_preference('scoring', 'margin_includes_dissenters', True)
+    def test_median_aggregation_even_panel(self):
+        """Test median aggregation with even-sized panels (uses ceil(mean) fallback).
+
+        margin_includes_dissenters=True is essential here: it makes
+        relevant_adjudicators() return *both* adjudicators (a genuinely
+        even-length input), so this actually exercises the ceil(mean(...))
+        fallback branch of _score_aggregator(). If only the majority
+        adjudicator were included (margin_includes_dissenters=False), the
+        input would collapse to a single (odd) value and this test would not
+        distinguish the fallback from the trivial odd-panel case.
+
+        The 'even' testdata's per-adjudicator scores are:
+          AFF: adj0=[80.0, 74.0, 35.5], adj1=[80.0, 79.0, 37.5]
+          NEG: adj0=[79.0, 76.0, 39.0], adj1=[73.0, 71.0, 39.5]
+        Several of these positions have a non-whole mean (e.g. AFF pos 2:
+        mean(74.0, 79.0) = 76.5), so ceil(mean(...)) is verifiably distinct
+        from what a naive statistics.median (which would average the two
+        middle values, giving 76.5, not 77.0) would produce.
+        """
+        testdata = self.testdata['even']
+        self.save_complete_result(testdata)
+
+        # AFF pos 1: mean(80.0, 80.0) = 80.0 -> ceil = 80.0
+        # AFF pos 2: mean(74.0, 79.0) = 76.5 -> ceil = 77.0
+        # AFF pos 3 (reply): mean(35.5, 37.5) = 36.5 -> ceil = 37.0
+        expected_aff_scores = [80.0, 77.0, 37.0]
+
+        # NEG pos 1: mean(79.0, 73.0) = 76.0 -> ceil = 76.0
+        # NEG pos 2: mean(76.0, 71.0) = 73.5 -> ceil = 74.0
+        # NEG pos 3 (reply): mean(39.0, 39.5) = 39.25 -> ceil = 40.0
+        expected_neg_scores = [76.0, 74.0, 40.0]
+
+        for pos, (aff_expected, neg_expected) in enumerate(zip(expected_aff_scores, expected_neg_scores), start=1):
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertAlmostEqual(aff_expected, self._get_speakerscore_in_db(DebateSide.AFF, pos).score,
+                                       msg=f"AFF position {pos} score mismatch")
+                self.assertAlmostEqual(neg_expected, self._get_speakerscore_in_db(DebateSide.NEG, pos).score,
+                                       msg=f"NEG position {pos} score mismatch")
+
+    @with_preference('scoring', 'score_aggregation_function', 'median')
+    @with_preference('scoring', 'margin_includes_dissenters', True)
+    def test_median_aggregation_with_criteria(self):
+        """Aggregate criteria for speaker scores, but average team totals."""
+        criteria = [
+            ScoreCriterion.objects.create(
+                tournament=self.tournament, name=name, seq=seq, weight=1,
+                min_score=0, max_score=50, step=1,
+            )
+            for seq, name in enumerate(("Content", "Style"), start=1)
+        ]
+        blank_result = self.save_blank_result(nadjs=3, nspeakers=2)
+        result = self.debate_result_class(blank_result.ballotsub, criteria=criteria)
+
+        for side, team in zip(self.SIDES, self.teams):
+            speakers = team.speaker_set.all()[:2]
+            for pos, speaker in enumerate(speakers, start=1):
+                result.set_speaker(side, pos, speaker)
+            result.set_speaker(side, 3, speakers[0])
+
+        # For AFF, each criterion has a median of 40, while the per-adjudicator
+        # totals are 70, 70, and 80 (median 70). NEG follows the same pattern
+        # one point lower per criterion.
+        for side, offset in ((DebateSide.AFF, 0), (DebateSide.NEG, -1)):
+            criterion_scores = ((30 + offset, 40 + offset),
+                                (40 + offset, 30 + offset),
+                                (40 + offset, 40 + offset))
+            for adj, scores in zip(self.adjs, criterion_scores):
+                for pos in result.positions:
+                    for criterion, score in zip(criteria, scores):
+                        result.set_criterion_score(adj, side, pos, criterion, score)
+
+        self.assertEqual(40, result.speakercriterionscore_field_score(DebateSide.AFF, 1, criteria[0]))
+        self.assertEqual(40, result.speakercriterionscore_field_score(DebateSide.AFF, 1, criteria[1]))
+        self.assertEqual(80, result.speakerscore_field_score(DebateSide.AFF, 1))
+        self.assertEqual(220, result.teamscore_field_score(DebateSide.AFF))
+
+        self.assertEqual(39, result.speakercriterionscore_field_score(DebateSide.NEG, 1, criteria[0]))
+        self.assertEqual(39, result.speakercriterionscore_field_score(DebateSide.NEG, 1, criteria[1]))
+        self.assertEqual(78, result.speakerscore_field_score(DebateSide.NEG, 1))
+        self.assertEqual(214, result.teamscore_field_score(DebateSide.NEG))
+
+    @with_preference('scoring', 'score_aggregation_function', 'mean')
+    @with_preference('scoring', 'margin_includes_dissenters', True)
+    @standard_test
+    def test_mean_aggregation_regression(self, result, testdata, scoresheet_type):
+        """Regression test: ensure mean aggregation (default) still works as before."""
+        for side, totals in zip(self.SIDES, testdata['common']['everyone_scores']):
+            for pos, score in enumerate(totals, start=1):
+                with suppress_logs('results.result', logging.WARNING):
+                    self.assertAlmostEqual(score, self._get_speakerscore_in_db(side, pos).score)
+                    self.assertAlmostEqual(score, result.speakerscore_field_score(side, pos))
+            legacy_team_score = mean(
+                result.scoresheets[adj].get_total(side) for adj in result.relevant_adjudicators()
+            )
+            self.assertAlmostEqual(legacy_team_score, result.teamscore_field_score(side))
+
+    # ==========================================================================
+    # Irregular operation
+    # ==========================================================================
+
+    @with_preference('scoring', 'margin_includes_dissenters', False)
+    # @with_preference('scoring', 'scoresheet_type', 'high-required')
+    def test_initially_unknown_sides(self):
+        self._unset_sides()
+        testdata = self.testdata['high']
+        self.save_complete_result(testdata,
+                post_create=lambda result: result.set_sides(*self.teams))
+        result = self.get_result()
+
+        # Just check a couple of fields
+        winner = testdata['high-required']['winner']
+        for side, margin in zip(self.SIDES, testdata['high-required']['majority_margins']):
+            with suppress_logs('results.result', logging.WARNING):
+                self.assertEqual(self._get_teamscore_in_db(side).win, side == winner)
+                self.assertEqual(result.teamscore_field_win(side), side == winner)
+                self.assertAlmostEqual(self._get_teamscore_in_db(side).margin, margin)
+                self.assertAlmostEqual(result.teamscore_field_margin(side), margin)
+
+    @incomplete_test
+    def test_unfilled_scoresheet_score(self, result):
+        result.scoresheets[self.adjs[0]].scores[DebateSide.AFF][1] = None
+
+    @bad_load_assertion_test
+    def test_extraneous_scoresheet(self, result):
+        result.scoresheets["not-an-adj"] = None
+
+
+class TestConsensusDebateResultWithScores(GeneralSpeakerTestsMixin, BaseTestDebateResult):
+
+    debate_result_class = ConsensusDebateResultWithScores
+    testdata = dict()
+
+    testdata['high'] = {
+        'declared_winner': DebateSide.AFF,
+        'scores': [[75.0, 76.0, 74.0, 38.0], [76.0, 73.0, 75.0, 37.5]],
+        'num_adjs': 3,
+        'num_speakers_per_team': 3,
+        'totals': [263.0, 261.5],
+        'margins': [1.5, -1.5],
+        'high-required': {'valid': True, 'winner': DebateSide.AFF},
+        'low-allowed': {'valid': True, 'winner': DebateSide.AFF},
+        'tied-allowed': {'valid': True, 'winner': DebateSide.AFF},
+    }
+
+    testdata['low'] = { # contains low-point wins that reverse the result
+        'declared_winners': DebateSide.AFF,
+        'scores': [[73.0, 76.0, 79.0, 37.5], [77.0, 77.0, 78.0, 39.0]],
+        'num_adjs': 3,
+        'num_speakers_per_team': 3,
+        'totals': [265.5, 271.0],
+        'margins': [-5.5, 5.5],
+        'high-required': {'valid': True, 'winner': DebateSide.NEG},
+        'low-allowed': {'valid': True, 'winner': DebateSide.AFF},
+        'tied-allowed': {'valid': False, 'winner': None},
+    }
+
+    testdata['tie'] = { # contains low-point wins that reverse the result
+        'declared_winners': DebateSide.NEG,
+        'scores': [[73.0, 72.0, 78.0, 40.0], [73.0, 75.0, 75.0, 40.0]],
+        'num_adjs': 3,
+        'num_speakers_per_team': 3,
+        'totals': [263.0, 263.0],
+        'margins': [0.0, 0.0],
+        'high-required': {'valid': False, 'winner': None},
+        'low-allowed': {'valid': True, 'winner': DebateSide.NEG},
+        'tied-allowed': {'valid': True, 'winner': DebateSide.NEG},
+    }
+
+    testdata['two-speakers'] = {  # two speakers per team
+        'declared_winners': DebateSide.NEG,
+        'scores': [[74.0, 76.0, 37.5], [74.0, 77.0, 37.0]],
+        'num_adjs': 1,
+        'num_speakers_per_team': 2,
+        'totals': [187.5, 188.0],
+        'margins': [-0.5, 0.5],
+        'common': {
+            'scores': [[74.0, 76.0, 37.5], [74.0, 77.0, 37.0]],
+            'totals_by_adj': [[187.5, 188.0]]},
+        'high-required': {'valid': True, 'winner': DebateSide.NEG},
+        'low-allowed': {'valid': True, 'winner': DebateSide.NEG},
+        'tied-allowed': {'valid': True, 'winner': DebateSide.NEG},
+    }
+
+    def save_scores_to_result(self, testdata, result):
+        if result.uses_speakers:
+            for side, teamscores in zip(self.SIDES, testdata['scores']):
+                for pos, score in enumerate(teamscores, start=1):
+                    result.set_score(side, pos, score)
+
+        if result.uses_declared_winners:
+            result.add_winner(testdata['declared_winner'])
+
+    # ==========================================================================
+    # Normal operation
+    # ==========================================================================
+
+    @standard_test
+    def test_save(self, result, testdata, scoresheet_type):
+        # Run self.save_complete_result and check completeness
+        self.assertTrue(result.is_complete())
+
+    @standard_test
+    def test_speaker_scores(self, result, testdata, scoresheet_type):
+        for side, totals in zip(self.SIDES, testdata['scores']):
+            for pos, score in enumerate(totals, start=1):
+                self.assertAlmostEqual(score, self._get_speakerscore_in_db(side, pos).score)
+                self.assertAlmostEqual(score, result.speakerscore_field_score(side, pos))
+
+    @standard_test
+    def test_teamscore_field_points(self, result, testdata, scoresheet_type):
+        for side in self.SIDES:
+            points = 1 if side == testdata[scoresheet_type]['winner'] else 0
+            self.assertEqual(points, self._get_teamscore_in_db(side).points)
+            self.assertEqual(points, result.teamscore_field_points(side))
+
+    @standard_test
+    def test_teamscore_field_win(self, result, testdata, scoresheet_type):
+        for side in self.SIDES:
+            win = side == testdata[scoresheet_type]['winner']
+            self.assertEqual(win, self._get_teamscore_in_db(side).win)
+            self.assertEqual(win, result.teamscore_field_win(side))
+
+    @standard_test
+    def test_teamscore_field_score(self, result, testdata, scoresheet_type):
+        for side, total in zip(self.SIDES, testdata['totals']):
+            self.assertAlmostEqual(total, self._get_teamscore_in_db(side).score)
+            self.assertAlmostEqual(total, result.teamscore_field_score(side))
+
+    @standard_test
+    def test_teamscore_field_margin(self, result, testdata, scoresheet_type):
+        for side, margin in zip(self.SIDES, testdata['margins']):
+            self.assertAlmostEqual(margin, self._get_teamscore_in_db(side).margin)
+            self.assertAlmostEqual(margin, result.teamscore_field_margin(side))
+
+    @standard_test
+    def test_teamscore_field_blank_fields(self, result, testdata, scoresheet_type):
+        for side in self.SIDES:
+            self.assertIsNone(self._get_teamscore_in_db(side).votes_given)
+            self.assertIsNone(self._get_teamscore_in_db(side).votes_possible)
+
+    # ==========================================================================
+    # Irregular operation
+    # ==========================================================================
+
+    # @with_preference('scoring', 'scoresheet_type', 'high-required')
+    def test_initially_unknown_sides(self):
+        self._unset_sides()
+        testdata = self.testdata['high']
+        self.save_complete_result(testdata,
+                post_create=lambda result: result.set_sides(*self.teams))
+        result = self.get_result()
+
+        # Just check a couple of fields
+        winner = testdata['high-required']['winner']
+        for side, margin in zip(self.SIDES, testdata['margins']):
+            self.assertEqual(self._get_teamscore_in_db(side).win, side == winner)
+            self.assertEqual(result.teamscore_field_win(side), side == winner)
+            self.assertAlmostEqual(self._get_teamscore_in_db(side).margin, margin)
+            self.assertAlmostEqual(result.teamscore_field_margin(side), margin)
+
+    @incomplete_test
+    def test_unfilled_scoresheet_score(self, result):
+        result.scoresheet.scores[DebateSide.AFF][1] = None
