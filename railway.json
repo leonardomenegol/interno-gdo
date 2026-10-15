@@ -5,7 +5,7 @@
     "buildCommand": "bash bin/railway-build.sh"
   },
   "deploy": {
-    "startCommand": "cd tabbycat && python run-asgi.py",
+    "startCommand": "bash start.sh",
     "healthcheckPath": "/",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3
