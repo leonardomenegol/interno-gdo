@@ -107,11 +107,6 @@
 
   <div class="row align-items-start">
 
-    <div class="col-md-4 text-center d-none d-md-flex flex-column align-items-center pt-2" style="gap:16px;">
-      <img src="{% static 'logo-torneio.png' %}" alt="{{ tournament.name }}" class="tournament-logo-top">
-      <img src="{% static 'dragao.gif' %}" alt="dragão" class="dragon-side">
-    </div>
-
     <div class="col-md-8 col-12">
 
       <div class="list-group mt-2">
@@ -344,6 +339,11 @@
         </div>
       {% endif %}
 
+    </div>
+
+    <div class="col-md-4 text-center d-none d-md-flex flex-column align-items-center pt-2" style="gap:16px;">
+      <img src="{% static 'logo-torneio.png' %}" alt="{{ tournament.name }}" class="tournament-logo-top">
+      <img src="{% static 'dragao.gif' %}" alt="dragão" class="dragon-side">
     </div>
 
   </div>
