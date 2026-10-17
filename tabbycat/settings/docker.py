@@ -3,6 +3,7 @@
 # ==============================================================================
 
 import os
+from urllib.parse import urlparse
 
 import dj_database_url
 
@@ -45,11 +46,21 @@ CACHES = {
     },
 }
 
+# Parse REDIS_URL into components so channels_redis receives password explicitly
+_redis = urlparse(REDIS_URL)
+_redis_host = {
+    "host": _redis.hostname,
+    "port": _redis.port or 6379,
+    "db": int((_redis.path or "/0").lstrip("/") or 0),
+}
+if _redis.password:
+    _redis_host["password"] = _redis.password
+
 CHANNEL_LAYERS = {
     "default": {
         "BACKEND": "channels_redis.core.RedisChannelLayer",
         "CONFIG": {
-            "hosts": [{"address": REDIS_URL}],
+            "hosts": [_redis_host],
             "group_expiry": 10800,
         },
     },
