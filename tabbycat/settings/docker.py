@@ -46,18 +46,13 @@ CACHES = {
     },
 }
 
-# Build channels_redis host config from individual env vars if available,
-# otherwise fall back to parsing REDIS_URL.
-# Railway exposes REDISHOST, REDISPORT, REDISPASSWORD individually which
-# are more reliable than the composite REDIS_URL inside Docker networking.
-if os.environ.get('REDISHOST'):
-    _redis_host = {
-        "host": os.environ['REDISHOST'],
-        "port": int(os.environ.get('REDISPORT', 6379)),
-        "password": os.environ.get('REDISPASSWORD') or os.environ.get('REDIS_PASSWORD') or None,
-    }
-    if not _redis_host["password"]:
-        del _redis_host["password"]
+# Build channels_redis host from individual vars (Railway) or parse REDIS_URL
+_redishost = os.environ.get('REDISHOST')
+_redispassword = os.environ.get('REDISPASSWORD') or os.environ.get('REDIS_PASSWORD')
+_redisport = int(os.environ.get('REDISPORT', 6379))
+
+if _redishost and _redispassword:
+    _redis_host = {"host": _redishost, "port": _redisport, "password": _redispassword}
 else:
     _parsed = urlparse(REDIS_URL)
     _redis_host = {
@@ -77,3 +72,25 @@ CHANNEL_LAYERS = {
         },
     },
 }
+
+# ==============================================================================
+# Email
+# ==============================================================================
+
+if os.environ.get('EMAIL_HOST', ''):
+    SERVER_EMAIL = os.environ['DEFAULT_FROM_EMAIL']
+    DEFAULT_FROM_EMAIL = os.environ['DEFAULT_FROM_EMAIL']
+    EMAIL_HOST = os.environ['EMAIL_HOST']
+    EMAIL_HOST_USER = os.environ['EMAIL_HOST_USER']
+    EMAIL_HOST_PASSWORD = os.environ['EMAIL_HOST_PASSWORD']
+    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+    EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'true').lower() == 'true'
+
+elif os.environ.get('SENDGRID_API_KEY', ''):
+    SERVER_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'root@localhost')
+    DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'notconfigured@tabbycatsite')
+    EMAIL_HOST = 'smtp.sendgrid.net'
+    EMAIL_HOST_USER = 'apikey'
+    EMAIL_HOST_PASSWORD = os.environ['SENDGRID_API_KEY']
+    EMAIL_PORT = 587
+    EMAIL_USE_TLS = True
