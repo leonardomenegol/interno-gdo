@@ -2,10 +2,13 @@
 # Docker
 # ==============================================================================
 
+import logging
 import os
 from urllib.parse import urlparse
 
 import dj_database_url
+
+_log = logging.getLogger(__name__)
 
 ALLOWED_HOSTS = ["*"]
 
@@ -46,13 +49,24 @@ CACHES = {
     },
 }
 
-# Build channels_redis host from individual vars (Railway) or parse REDIS_URL
+# Build channels_redis host — try every source in order
 _redishost = os.environ.get('REDISHOST')
 _redispassword = os.environ.get('REDISPASSWORD') or os.environ.get('REDIS_PASSWORD')
 _redisport = int(os.environ.get('REDISPORT', 6379))
 
+_log.warning(
+    "REDIS cfg: REDIS_URL_set=%s REDISHOST=%s REDISHOST_set=%s REDISPASSWORD_set=%s",
+    bool(os.environ.get('REDIS_URL')),
+    _redishost or 'NONE',
+    bool(_redishost),
+    bool(_redispassword),
+)
+
 if _redishost and _redispassword:
     _redis_host = {"host": _redishost, "port": _redisport, "password": _redispassword}
+elif REDIS_URL != 'redis://redis:6379/1':
+    # REDIS_URL was explicitly set (not default), use it directly
+    _redis_host = {"address": REDIS_URL}
 else:
     _parsed = urlparse(REDIS_URL)
     _redis_host = {
