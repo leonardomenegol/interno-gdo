@@ -46,22 +46,27 @@ CACHES = {
     },
 }
 
-# Parse REDIS_URL into components so channels_redis receives password explicitly
-_redis = urlparse(REDIS_URL)
-import logging as _logging
-_logging.getLogger().warning(
-    "REDIS_URL debug: scheme=%s host=%s port=%s password=%s path=%s",
-    _redis.scheme, _redis.hostname, _redis.port,
-    "SET" if _redis.password else "NOT SET",
-    _redis.path,
-)
-_redis_host = {
-    "host": _redis.hostname,
-    "port": _redis.port or 6379,
-    "db": int((_redis.path or "/0").lstrip("/") or 0),
-}
-if _redis.password:
-    _redis_host["password"] = _redis.password
+# Build channels_redis host config from individual env vars if available,
+# otherwise fall back to parsing REDIS_URL.
+# Railway exposes REDISHOST, REDISPORT, REDISPASSWORD individually which
+# are more reliable than the composite REDIS_URL inside Docker networking.
+if os.environ.get('REDISHOST'):
+    _redis_host = {
+        "host": os.environ['REDISHOST'],
+        "port": int(os.environ.get('REDISPORT', 6379)),
+        "password": os.environ.get('REDISPASSWORD') or os.environ.get('REDIS_PASSWORD') or None,
+    }
+    if not _redis_host["password"]:
+        del _redis_host["password"]
+else:
+    _parsed = urlparse(REDIS_URL)
+    _redis_host = {
+        "host": _parsed.hostname,
+        "port": _parsed.port or 6379,
+        "db": int((_parsed.path or "/0").lstrip("/") or 0),
+    }
+    if _parsed.password:
+        _redis_host["password"] = _parsed.password
 
 CHANNEL_LAYERS = {
     "default": {
