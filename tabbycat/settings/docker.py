@@ -48,6 +48,13 @@ CACHES = {
 
 # Parse REDIS_URL into components so channels_redis receives password explicitly
 _redis = urlparse(REDIS_URL)
+import logging as _logging
+_logging.getLogger().warning(
+    "REDIS_URL debug: scheme=%s host=%s port=%s password=%s path=%s",
+    _redis.scheme, _redis.hostname, _redis.port,
+    "SET" if _redis.password else "NOT SET",
+    _redis.path,
+)
 _redis_host = {
     "host": _redis.hostname,
     "port": _redis.port or 6379,
