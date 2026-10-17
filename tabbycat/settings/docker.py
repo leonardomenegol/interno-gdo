@@ -91,7 +91,13 @@ CHANNEL_LAYERS = {
 # Email
 # ==============================================================================
 
-if os.environ.get('EMAIL_HOST', ''):
+if os.environ.get('RESEND_API_KEY', ''):
+    ANYMAIL = {"RESEND_API_KEY": os.environ['RESEND_API_KEY']}
+    EMAIL_BACKEND = 'anymail.backends.resend.EmailBackend'
+    DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'onboarding@resend.dev')
+    SERVER_EMAIL = DEFAULT_FROM_EMAIL
+
+elif os.environ.get('EMAIL_HOST', ''):
     SERVER_EMAIL = os.environ['DEFAULT_FROM_EMAIL']
     DEFAULT_FROM_EMAIL = os.environ['DEFAULT_FROM_EMAIL']
     EMAIL_HOST = os.environ['EMAIL_HOST']
