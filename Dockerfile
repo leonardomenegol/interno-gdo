@@ -28,6 +28,7 @@ RUN git config --global url."https://".insteadOf git://
 RUN pip install --upgrade pip
 RUN pip install pipenv
 RUN pipenv install --system
+RUN pip install "django-anymail[resend]"
 RUN npm ci
 
 # Compile all the static files
