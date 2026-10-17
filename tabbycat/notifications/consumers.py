@@ -10,7 +10,6 @@ from django.template import Context, Template
 from html2text import html2text
 
 from draw.models import Debate
-from participants.models import Person
 from tournaments.models import Round, Tournament
 
 from .email_tracking import build_hook_id, send_tracked_emails, tournament_from_email
@@ -61,8 +60,9 @@ class NotificationQueueConsumer(SyncConsumer):
         subject = Template(event['subject'])
         html_body = Template(event['body'])
 
-        recipients = Person.objects.filter(pk__in=event['send_to'] or [], email__isnull=False).exclude(email='')
-        contexts = self.NOTIFICATION_GENERATORS[notification_type].generate(to=recipients, **event['extra'])
+        generator_class = self.NOTIFICATION_GENERATORS[notification_type]
+        recipients = generator_class.get_recipients(event['send_to'] or [])
+        contexts = generator_class.generate(to=recipients, **event['extra'])
 
         # Prepare messages
 
